@@ -1,0 +1,21 @@
+!rm -rf /content/drive/MyDrive/OW-DETR/Data/OWDETR/VOC2007/JPEGimagesy
+# install Anaconda3
+!wget -qO ac.sh https://repo.anaconda.com/archive/Anaconda3-2021.05-Linux-x86_64.sh
+!bash ./ac.sh -b
+# a fake google.colab library
+!ln -s /usr/local/lib/python3.7/dist-packages/google \
+       /root/anaconda3/lib/python3.8/site-packages/google
+import os
+os.environ['PATH'] = '/root/anaconda3/bin:' + os.environ['PATH']
+import sys
+_ = (sys.path
+        .append("/usr/local/lib/python3.8/site-packages"))
+!python -V
+!conda info --env
+!conda create -n owdetr python=3.7 pip
+!conda init
+
+!echo 'export PATH="/root/anaconda3/bin:$PATH"' >> ~/.bashrc
+!source ~/.bashrc
+
+bash

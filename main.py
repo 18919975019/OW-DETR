@@ -208,8 +208,7 @@ def main(args):
     device = torch.device(args.device)
 
     # 设置random seed以复现
-    seed = args.seed
-    # seed = args.seed + utils.get_rank()
+    seed = args.seed + utils.get_rank()
     torch.manual_seed(seed)
     np.random.seed(seed)
     random.seed(seed)
