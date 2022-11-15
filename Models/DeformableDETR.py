@@ -9,7 +9,7 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        is_dist_avail_and_initialized, inverse_sigmoid)
 
 from .ResNet_50 import build_backbone
-from DeformableTransformer import build_deforamble_transformer
+from .DeformableTransformer import build_deforamble_transformer
 from .HungarianMatcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)

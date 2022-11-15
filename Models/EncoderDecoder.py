@@ -2,7 +2,7 @@ import copy
 import torch
 import torch.nn.functional as F
 from torch import nn, Tensor
-from MSDeformableAttn import MSDeformAttn
+from .MSDeformableAttn import MSDeformAttn
 
 def inverse_sigmoid(x, eps=1e-5):
     x = x.clamp(min=0, max=1)

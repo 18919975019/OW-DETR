@@ -3,9 +3,9 @@ import torch
 from torch import nn
 from torch.nn.init import xavier_uniform_, constant_, uniform_, normal_
 from einops import rearrange
-from MSDeformableAttn import MSDeformAttn
+from .MSDeformableAttn import MSDeformAttn
 
-from EncoderDecoder import EncoderLayer, DecoderLayer, _make_encoder, _make_decoder
+from .EncoderDecoder import EncoderLayer, DecoderLayer, _make_encoder, _make_decoder
 
 
 class DeformableTransformer(nn.Module):

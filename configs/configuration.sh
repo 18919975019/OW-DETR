@@ -1,3 +1,4 @@
+#!/usr/bin/env bash
 set -x
 
 EXP_DIR=exps/OWDETR_t1
