@@ -48,7 +48,7 @@ class MSDeformAttn(nn.Module):
 
     def _reset_parameters(self):
         # 将采样offset的网络的权重初始化为0，计算并固定每个采样点的偏置
-        constant_(self.sampling_offsets.weight.data, 0.)
+        constant_(self.sampling.weight.data, 0.)
         # theta = 2pi * (head_id/n_heads)
         thetas = torch.arange(self.n_heads, dtype=torch.float32) * (2.0 * math.pi / self.n_heads)
         # 为每一个注意力头计算[cos theta, sin theta],grid_init.size:(注意力头数 * 2（一对三角函数）)
@@ -62,19 +62,19 @@ class MSDeformAttn(nn.Module):
         # 将每个注意力头、每个尺度上的所有采样点的三角函数对展开成一列作为采样offset的网络的权重的偏置，并且这些偏置没有梯度，在反向传播中不修改值
         # 每个头的每个尺度的第i个采样点的偏置相同
         with torch.no_grad():
-            self.sampling_offsets.bias = nn.Parameter(grid_init.view(-1))
+            self.sampling.bias = nn.Parameter(grid_init.view(-1))
 
         # 将学习注意力得分的网络的权重、偏置初始化为0
         constant_(self.attention_weights.weight.data, 0.)
         constant_(self.attention_weights.bias.data, 0.)
 
         # 将投影得到value的网络的偏置初始化为0，权重初始化为均匀分布，使得该层输入和输出的方差相近
-        xavier_uniform_(self.value_proj.weight.data)
-        constant_(self.value_proj.bias.data, 0.)
+        xavier_uniform_(self.v.weight.data)
+        constant_(self.v.bias.data, 0.)
 
         # 将投影得到注意力头输出的网络的偏置初始化为0，权重初始化为均匀分布，使得该层输入和输出的方差相近
-        xavier_uniform_(self.output_proj.weight.data)
-        constant_(self.output_proj.bias.data, 0.)
+        xavier_uniform_(self.fc.weight.data)
+        constant_(self.fc.bias.data, 0.)
 
     @staticmethod
     def attention(value, value_spatial_shapes, sampling_locations, attention_weights):
@@ -132,7 +132,7 @@ class MSDeformAttn(nn.Module):
         # value.size(样本数 * pixel_num * 头数 * 每一个头上分得的向量维度)
         value = rearrange(value, "b n (h d) -> b n h d ", h=self.n_heads)
         # sampling_offsets.size(样本数 * Len_q * 头数 * 尺度数 * 采样点个数 * 坐标维度（2）)
-        sampling_offsets = self.sampling_offsets(query)
+        sampling_offsets = self.sampling(query)
         sampling_offsets = rearrange(sampling_offsets, "b n (h l p o) -> b n h l p o",
                                      h=self.n_heads, l=self.n_levels, p=self.n_points, o=2)
         attention_weights = self.attention_weights(query)

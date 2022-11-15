@@ -113,7 +113,7 @@ class Joiner(nn.Sequential):
         super().__init__(backbone, position_embedding)
         self.strides = backbone.strides
         self.n_channels = backbone.n_channels
-        self.resolutions = 3
+        self.n_resolutions = 3
 
     def forward(self, tensor_list: NestedTensor):
         # resnet: 前向传播tensor_list（tensor+mask），返回out:['0':(tensor,mask),'1':(tensor,mask),...,]

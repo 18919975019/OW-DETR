@@ -25,6 +25,7 @@ def _get_activation_fn(activation):
 
 class FFN(nn.Module):
     def __init__(self, d_model, d_fc, activation, dropout):
+        super(FFN, self).__init__()
         self.nn1 = nn.Linear(d_model, d_fc)
         self.af = _get_activation_fn(activation)
         self.do = nn.Dropout(dropout)
@@ -43,10 +44,10 @@ class Residual(nn.Module):
         return self.dropout(self.fn(x, **kwargs)) + x
 
 class AddNorm(nn.Module):
-    def __init__(self, d_model, block):
+    def __init__(self, d_model, block, dropout):
         super(AddNorm, self).__init__()
-        self.residual = Residual(block)
-        self.norm = nn.LayerNormalize(d_model)
+        self.residual = Residual(block, dropout)
+        self.norm = nn.LayerNorm(d_model)
 
     def forward(self, x, **kwargs):
         return self.norm(self.residual(x), **kwargs)
@@ -59,9 +60,9 @@ class EncoderLayer(nn.Module):
 
         super().__init__()
         # Self-Attention Block, output:(b, h*w*lvl, d_model)
-        self.self_attn = AddNorm(d_model, MSDeformAttn(d_model, n_levels, n_heads, n_points))
+        self.self_attn = AddNorm(d_model, MSDeformAttn(d_model, n_levels, n_heads, n_points), dropout)
         # FFN Block, output:(b, h*w*lvl, d_model)
-        self.ffn = AddNorm(d_model, FFN(d_model, d_fc, activation, dropout))
+        self.ffn = AddNorm(d_model, FFN(d_model, d_fc, activation, dropout), dropout)
 
     @staticmethod
     def with_pos_embed(tensor, pos):
@@ -118,11 +119,11 @@ class DecoderLayer(nn.Module):
         super().__init__()
 
         # Self-Attention Block, output:(b, h*w*lvl, d_model)
-        self.self_attn = AddNorm(d_model, nn.MultiheadAttention(d_model, n_heads, dropout=dropout))
+        self.self_attn = AddNorm(d_model, nn.MultiheadAttention(d_model, n_heads, dropout=dropout), dropout)
         # Cross-Attention Block, output:(b, h*w*lvl, d_model)
-        self.cross_attn = AddNorm(d_model, MSDeformAttn(d_model, n_levels, n_heads, n_points))
+        self.cross_attn = AddNorm(d_model, MSDeformAttn(d_model, n_levels, n_heads, n_points), dropout)
         # FFN Block, output:(b, h*w*lvl, d_model)
-        self.ffn = AddNorm(d_model, FFN(d_model, d_fc, activation, dropout))
+        self.ffn = AddNorm(d_model, FFN(d_model, d_fc, activation, dropout), dropout)
 
     @staticmethod
     def with_pos_embed(tensor, pos):

@@ -98,10 +98,10 @@ class DeformableDETR(nn.Module):
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
         # 初始化self.class_embed网络的偏置
-        self.class_embed.bias.data = torch.ones(num_classes) * bias_value
+        self.class_predictor.bias.data = torch.ones(num_classes) * bias_value
         # 用0初始化self.bbox_embed（MLP）最后一个线性层的权重和偏置
-        nn.init.constant_(self.bbox_embed.layers[-1].weight.data, 0)
-        nn.init.constant_(self.bbox_embed.layers[-1].bias.data, 0)
+        nn.init.constant_(self.bbox_predictor.layers[-1].weight.data, 0)
+        nn.init.constant_(self.bbox_predictor.layers[-1].bias.data, 0)
         for proj in self.channel_convertor:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
@@ -111,17 +111,17 @@ class DeformableDETR(nn.Module):
         n_pred = transformer.decoder.n_layers
         if with_box_refine:
             # 为每个decoder_layer设置一个self.bbox_embed,利用每个decoder_layer的输出向量来预测一次候选框
-            self.class_embed = _get_clones(self.class_embed, n_pred)
-            self.bbox_embed = _get_clones(self.bbox_embed, n_pred)
-            nn.init.constant_(self.bbox_embed[0].layers[-1].bias.data[2:], -2.0)
+            self.class_predictor = _get_clones(self.class_predictor, n_pred)
+            self.bbox_predictor = _get_clones(self.bbox_predictor, n_pred)
+            nn.init.constant_(self.bbox_predictor[0].layers[-1].bias.data[2:], -2.0)
             # hack implementation for iterative bounding box refinement
-            self.transformer.decoder.bbox_embed = self.bbox_embed
+            self.transformer.decoder.bbox_embed = self.bbox_predictor
         else:
-            nn.init.constant_(self.bbox_embed.layers[-1].bias.data[2:], -2.0)
+            nn.init.constant_(self.bbox_predictor.layers[-1].bias.data[2:], -2.0)
             # decoder每一层的输出通过一个self.class_embed网络，预测一次类别+框坐标
             # 每一层class_embed和bbox_embed为浅拷贝, 共享参数, 随着训练同时变化参数，即对每一层使用同样的网络预测
-            self.class_embed = nn.ModuleList([self.class_embed for _ in range(n_pred)])
-            self.bbox_embed = nn.ModuleList([self.bbox_embed for _ in range(n_pred)])
+            self.class_predictor = nn.ModuleList([self.class_predictor for _ in range(n_pred)])
+            self.bbox_predictor = nn.ModuleList([self.bbox_predictor for _ in range(n_pred)])
             self.transformer.decoder.bbox_embed = None
 
     def forward(self, samples: NestedTensor):
@@ -180,8 +180,8 @@ class DeformableDETR(nn.Module):
             else:
                 reference = inter_references[layer - 1]
             reference = inverse_sigmoid(reference)
-            outputs_class = self.class_embed[layer](hs[layer])
-            tmp = self.bbox_embed[layer](hs[layer])
+            outputs_class = self.class_predictor[layer](hs[layer])
+            tmp = self.bbox_predictor[layer](hs[layer])
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
