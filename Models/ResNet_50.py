@@ -73,24 +73,44 @@ class BackboneBase(nn.Module):
         self.body = IntermediateLayerGetter(backbone, return_layers=return_layers)
 
     def forward(self, tensor_list: NestedTensor):
-        # xs.items() : [('0',tensor(),('1',tensor(),...]
+        """
+        The input is a NestedTensor of img, where consists of the tensor and the mask. The mask is only for semantic segmentation.
+        We put input into the intermediate layer of resnet50, and get the output tensor of each layer, and then combine them with their
+        corresponding scaled mask.
+        :param tensor_list:
+        :return out of each layer in backbone, out:NestedTensor(tensor,mask)
+        """
+        # xs.items() : [('0',tensor(),'1',tensor(),...]
         xs = self.body(tensor_list.tensors)
         out: Dict[str, NestedTensor] = {}
-        for name, x in xs.items():
+        for name, tensor in xs.items():
             # x = tensor_list.tensor
+            # m为img原本的mask
             m = tensor_list.mask
             assert m is not None
-
-            # 生成元素为bool值的掩码矩阵，但是去除channel维度，为和tensor同高宽的单通道掩码矩阵
-            mask = F.interpolate(m[None].float(), size=x.shape[-2:]).to(torch.bool)[0]
-
-            # out:['0':(tensor,mask),'1':(tensor,mask),...,]
-            out[name] = NestedTensor(x, mask)
+            # 将img原本的mask通过插值,生成和out_tensor同高宽的单通道mask
+            mask = F.interpolate(m[None].float(), size=tensor.shape[-2:]).to(torch.bool)[0]
+            # tensor:(b,c,h,w),mask:(b,h,w)
+            # out:['0':NestedTensor(tensor,mask),'1':NestedTensor(tensor,mask),...,]
+            out[name] = NestedTensor(tensor, mask)
         return out
 
 
 class Backbone(BackboneBase):
-    """ResNet backbone with frozen BatchNorm."""
+    """
+    Here is a 3-hidden-layer backbone(resnet-50), the input is a NestedTensor of img, where consists of the tensor and
+    the mask. The mask is only for semantic segmentation.We put input into the intermediate layer of resnet50, and get
+    the output tensor of each layer, and then combine them with their corresponding scaled mask.
+
+    The 3-hidden-layer network structure is as followed:
+    self.strides:[8, 16, 32]
+    self.n_channels:[512, 1024, 2048]
+    self.body:{"layer2": "0", "layer3": "1", "layer4": "2"}
+
+    The forward process is as followed:
+    input: tensor_list:NestedTensor(tensor,mask)
+    output:out of each hidden layer in backbone:NestedTensor(tensor,mask)
+    """
     def __init__(self, name: str,
                  train_backbone: bool,
                  return_interm_layers: bool,
@@ -102,6 +122,7 @@ class Backbone(BackboneBase):
             pretrained=is_main_process(), norm_layer=norm_layer)
         # backbone就是resnet50，类型为nn.Module
         assert name not in ('resnet18', 'resnet34'), "number of channels are hard coded"
+        # 继承BackboneBase的构造方法，构造self.strides, self.n_channels, self.body
         super().__init__(backbone, train_backbone, return_interm_layers)
         # 步长变为原来的1/2，扩张输出的size为原来的两倍
         if dilation:
@@ -109,32 +130,51 @@ class Backbone(BackboneBase):
 
 
 class Joiner(nn.Sequential):
-    def __init__(self, backbone, position_embedding):
-        super().__init__(backbone, position_embedding)
+    """
+    Here is a 2-block sequential, which consists of a backbone and a position encoder. The img as NestedTensor is put
+    into the backbone to get the output of each layer as feature maps of each level, and then these feature maps are put
+    into the position encoder to get the position embedding of each level.
+
+    The 3-hidden-layer network structure is as followed:
+        self.strides:[8, 16, 32]
+        self.n_channels:[512, 1024, 2048]
+        self.n_resolutions:3
+        self[0]:resnet-50{"layer2": "0", "layer3": "1", "layer4": "2"}
+        self[1]:position encoder
+
+        The forward process is as followed:
+        input: tensor_list:NestedTensor(tensor,mask)
+        output:out of each hidden layer in backbone:NestedTensor(tensor,mask)
+              :pos embedding of each hidden layer in backbone
+    """
+    def __init__(self, backbone, position_encoder):
+        # 继承backbone的构造方法, 构造self.strides, self.n_channels, self.body
+        super().__init__(backbone, position_encoder)
         self.strides = backbone.strides
         self.n_channels = backbone.n_channels
         self.n_resolutions = 3
 
     def forward(self, tensor_list: NestedTensor):
         # resnet: 前向传播tensor_list（tensor+mask），返回out:['0':(tensor,mask),'1':(tensor,mask),...,]
+        # self[0]=backbone,self[1]=pos
         xs = self[0](tensor_list)
-        # out保存resnet每一层的输出, pos保存resnet每一层输出产生的pos embedding
         out = []
         pos = []
         # x为resnet50中间层的输出，name为层索引:"layer1": "0", "layer2": "1", "layer3": "2", "layer4": "3"
-        for name, x in sorted(xs.items()):
-            out.append(x)
-        # position encoding
-        for x in out:
-            pos.append(self[1](x).to(x.tensors.dtype))
+        for name, nestedtensor in sorted(xs.items()):
+            out.append(nestedtensor)
+        # 每一层输出的tensor通过position_encoder,输出每一层的position embed
+        for nestedtensor in out:
+            pos_embed = self[1](nestedtensor).to(nestedtensor.tensors.dtype)
+            pos.append(pos_embed)
 
         return out, pos
 
 
 def build_backbone(args):
-    position_embedding = build_position_encoding(args)
-    train_backbone = args.lr_backbone > 0
-    return_interm_layers = (args.num_feature_levels > 1)
-    backbone = Backbone(args.backbone, train_backbone, return_interm_layers, args.dilation)
-    model = Joiner(backbone, position_embedding)
+    position_encoder = build_position_encoding(args)
+    if_train = args.lr_backbone > 0
+    if_return_interm_layers = (args.num_feature_levels > 1)
+    backbone = Backbone(args.backbone, if_train, if_return_interm_layers, args.dilation)
+    model = Joiner(backbone, position_encoder)
     return model

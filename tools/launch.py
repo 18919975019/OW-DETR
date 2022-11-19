@@ -8,11 +8,6 @@ import torch
 
 
 def parse_args():
-    """
-    Helper function parsing the command line options
-    @retval ArgumentParser
-    """
-
     parser = ArgumentParser(description="PyTorch distributed training launch "
                                         "helper utilty that will spawn up "
                                         "multiple distributed processes")

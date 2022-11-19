@@ -209,19 +209,19 @@ class DeformableDETR(nn.Module):
 
 
 class SetCriterion(nn.Module):
-    """ This class computes the loss for DETR.
-    The process happens in two steps:
-        1) we compute hungarian assignment between ground truth boxes and the outputs of the model
-        2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
+    """
+    This class computes the loss for DETR.
+    The process happens at two steps:
+    1) we compute hungarian assignment between ground truth boxes and the outputs of the model
+    2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
     def __init__(self, num_classes, matcher, weight_dict, losses, focal_alpha=0.25):
         """ Create the criterion.
-        Parameters:
-            num_classes: number of object categories, omitting the special no-object category
-            matcher: module able to compute a matching between targets and proposals
-            weight_dict: dict containing as key the names of the losses and as values their relative weight.
-            losses: list of all the losses to be applied. See get_loss for list of available losses.
-            focal_alpha: alpha in Focal Loss
+        :param num_classes: number of object categories, omitting the special no-object category
+        :param matcher: module able to compute a matching between targets and proposals
+        :param weight_dict: [losses:weight].
+        :param losses: list of all the losses to be applied. See get_loss for list of available losses.
+        :param focal_alpha: alpha in Focal Loss
         """
         super().__init__()
         self.num_classes = num_classes
@@ -333,6 +333,7 @@ class SetCriterion(nn.Module):
         return batch_idx, tgt_idx
 
     def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
+        # dict that index the different loss computation method
         loss_map = {
             'labels': self.loss_labels,
             'cardinality': self.loss_cardinality,
@@ -343,22 +344,29 @@ class SetCriterion(nn.Module):
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
     def forward(self, outputs, targets):
-        """ This performs the loss computation.
-        Parameters:
-             outputs: dict of tensors, see the output specification of the model for the format
-             targets: list of dicts, such that len(targets) == batch_size.
-                      The expected keys in each dict depends on the losses applied, see each loss' doc
         """
+        This performs the loss computation.
+        :param outputs: A dict of tensors, see the output specification of the model for the format
+        :param targets: A list of dicts, such that len(targets) == batch_size.
+
+        :return losses: A dict as followed:
+                {'loss_ce': ,
+                 'cardinality_error': ,
+                 'loss_giou': ,
+                }
+        """
+        # 存储decoder最后一层的输出
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}
 
         # Retrieve the matching between the outputs of the last layer and the targets
         indices = self.matcher(outputs_without_aux, targets)
 
-        # Compute the average number of target boxes accross all nodes, for normalization purposes
+        # 将batch中每张img的target bboxes求和得到batch的总target bbox数量
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
+        # 计算每个节点上的平均target bbox数量
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
 
         # Compute all the requested losses
@@ -382,6 +390,16 @@ class SetCriterion(nn.Module):
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
+        """
+        {'loss_ce_0':,
+        'cardinality_error_0':,
+        'loss_giou_0':,
+        ...
+        'loss_ce_4':,
+        'cardinality_error_4':,
+        'loss_giou_4':,
+        }
+        """
 
         if 'enc_outputs' in outputs:
             enc_outputs = outputs['enc_outputs']
@@ -402,6 +420,13 @@ class SetCriterion(nn.Module):
                 losses.update(l_dict)
 
         return losses
+
+        """
+        {'loss_ce_enc':,
+        'cardinality_error_enc':,
+        'loss_giou_enc':,
+        """
+
 
 
 class PostProcess(nn.Module):
@@ -444,18 +469,18 @@ class PostProcess(nn.Module):
 def build_OWDETR(args):
 
     # 为模型指定分类的类别数量
-    # if args.dataset_file == 'coco'
     num_classes = 91
-    # 选择cpu/gpu
     device = torch.device(args.device)
     """
-      初始化model
+    Construct the 2-block model, which consists of a backbone and a deformable transformer
+    :param num_classes=91
+    :param num_queries=100
+    :param num_feature_levels=4
+    :param aux_loss=True: add intermediate loss in the decoder
+    :param with_box_refine=False
     """
-    # 创建backbone网络
     backbone = build_backbone(args)
-    # 创建transformer网络
     transformer = build_deforamble_transformer(args)
-    # 创建DeformableDETR和matcher
     model = DeformableDETR(
         backbone,
         transformer,
@@ -468,7 +493,7 @@ def build_OWDETR(args):
     model.to(device)
 
     """
-      初始化criterion
+    Construct the criterion branch, which computes the loss.
     """
     # 初始化匹配器
     matcher = build_matcher(args)
@@ -478,10 +503,19 @@ def build_OWDETR(args):
                    'loss_giou': args.giou_loss_coef}
     # TODO this is a hack
     # 创建字典记录decoder每一层输出的损失名称及其权重
+
+    # 如果加入aux loss
+    if not args.no_aux_loss:
+        aux_weight_dict = {}
+        for i in range(args.dec_layers - 1):
+            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
+        aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
+        weight_dict.update(aux_weight_dict)
     """
-        weight_dict = {'loss_cls': args.cls_loss_coef,
+    if add aux loss
+    weight_dict = {'loss_cls': args.cls_loss_coef,
                        'loss_bbox': args.bbox_loss_coef,
-                       'loss_giou': args.giou_loss_coef,
+                       'loss_giou': args.giou_loss_coef
                        'loss_cls_enc': args.cls_loss_coef,
                        'loss_bbox_enc': args.bbox_loss_coef,
                        'loss_giou_enc': args.giou_loss_coef,
@@ -491,15 +525,11 @@ def build_OWDETR(args):
                        'loss_cls_2':args.cls_loss_coef,
                        'loss_bbox_2':args.bbox_loss_coef,
                        'loss_giou_2':args.giou_loss_coef
+                       'loss_cls_3':args.cls_loss_coef,
+                       'loss_bbox_3':args.bbox_loss_coef,
+                       'loss_giou_3':args.giou_loss_coef
                        }
-        """
-    if not args.no_aux_loss:
-        aux_weight_dict = {}
-        for i in range(args.dec_layers - 1):
-            aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
-        aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
-        weight_dict.update(aux_weight_dict)
-
+    """
 
     losses = ['labels', 'boxes', 'cardinality']
     criterion = SetCriterion(num_classes, matcher, weight_dict, losses, focal_alpha=args.focal_alpha)
