@@ -28,7 +28,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
     header = 'Epoch: [{}]'.format(epoch)
     print_freq = 10
 
-    # 利用指针指向train set中的第一个batch
+    """
+    This part is to accelerate the copy from cpu to gpu.
+    When the forward propagation of current batch is carried out in default stram, 
+    the next batch is prefetched into another stream parallelly. 
+    """
     prefetcher = data_prefetcher(data_loader, device, prefetch=True)
     samples, targets = prefetcher.next()
 
@@ -37,11 +41,11 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         outputs = model(samples)
 
         # 三部分损失
-        loss_dict = criterion(samples, outputs, targets, epoch)  ## samples variable needed for feature selection
+        loss_dict = criterion(samples, outputs, targets, epoch)
         # 三部分损失的权重
         weight_dict = deepcopy(criterion.weight_dict)
-        ## condition for starting nc loss computation after certain epoch so that the F_cls branch has the time
-        ## to learn the within classes seperation.
+        # condition for starting nc loss computation after certain epoch so that the F_cls branch has the time
+        # to learn the within classes separation.
         # 在前n=nc_epoch个epoch, 不训练novelty classification branch, 将novelty classification的权重设置为0
         if epoch < nc_epoch:
             for k, v in weight_dict.items():
@@ -49,18 +53,17 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
                     weight_dict[k] = 0
 
         losses = sum(loss_dict[k] * weight_dict[k] for k in loss_dict.keys() if k in weight_dict)
-        # reduce losses over all GPUs for logging purposes
+        # 计算所有gpu上的平均loss,在logging中输出
         loss_dict_reduced = utils.reduce_dict(loss_dict)
-        # Just printing NOt affectin gin loss function
-        loss_dict_reduced_unscaled = {f'{k}_unscaled': v
-                                      for k, v in loss_dict_reduced.items()}
-        loss_dict_reduced_scaled = {k: v * weight_dict[k]
-                                    for k, v in loss_dict_reduced.items() if k in weight_dict}
+        # 存储每一种loss
+        loss_dict_reduced_unscaled = {f'{k}_unscaled': v for k, v in loss_dict_reduced.items()}
+        # 存储每一种加权的loss
+        loss_dict_reduced_scaled = {k: v * weight_dict[k] for k, v in loss_dict_reduced.items() if k in weight_dict}
+        # 加权平均的total loss
         losses_reduced_scaled = sum(loss_dict_reduced_scaled.values())
-
-        # 总损失
         loss_value = losses_reduced_scaled.item()
 
+        # 如果loss爆炸, 停止训练退出程序
         if not math.isfinite(loss_value):
             print("Loss is {}, stopping training".format(loss_value))
             print(loss_dict_reduced)
@@ -69,6 +72,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         # 优化器梯度置0, 反向传播
         optimizer.zero_grad()
         losses.backward()
+        # 梯度剪裁
         if max_norm > 0:
             grad_total_norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
         else:
@@ -81,7 +85,7 @@ def train_one_epoch(model: torch.nn.Module, criterion: torch.nn.Module,
         metric_logger.update(lr=optimizer.param_groups[0]["lr"])
         metric_logger.update(grad_norm=grad_total_norm)
 
-        # 利用指针指向train set中的下一个batch
+        # 将下一个batch读进另一个stream,从cpu拷贝到gpu
         samples, targets = prefetcher.next()
 
     # gather the stats from all processes

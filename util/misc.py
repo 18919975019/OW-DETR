@@ -157,12 +157,10 @@ def all_gather(data):
 
 def reduce_dict(input_dict, average=True):
     """
-    Args:
-        input_dict (dict): all the values will be reduced
-        average (bool): whether to do average or sum
-    Reduce the values in the dictionary from all processes so that all processes
-    have the averaged results. Returns a dict with the same fields as
-    input_dict, after reduction.
+    Reduce the values in the dictionary from all processes so that all processes have the averaged results.
+    :param input_dict : all the values will be reduced
+    :param average : whether to do average or sum
+    :return A dict with the same fields as input_dict, after reduction.
     """
     world_size = get_world_size()
     if world_size < 2:
