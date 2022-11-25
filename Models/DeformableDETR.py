@@ -690,6 +690,7 @@ def build_OWDETR(args):
     device = torch.device(args.device)
     """
     Construct the 2-block model, which consists of a backbone and a deformable transformer
+    
     :param num_classes=91
     :param num_queries=100
     :param num_feature_levels=4
@@ -714,6 +715,13 @@ def build_OWDETR(args):
     model.to(device)
     """
     Construct the criterion branch, which computes the loss.
+    
+    :param num_classes: total number of classes 
+    :param num_seen_classes: number of recognized classes in current stage
+    :param invalid_cls_logits: logits of unrecognized classes
+    :param matcher 
+    :param weight_dict
+    :param losses
     """
     # 准备loss的权重字典
     weight_dict = {'loss_ce': args.cls_loss_coef,
