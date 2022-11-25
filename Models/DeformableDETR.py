@@ -1,71 +1,71 @@
+"""
+Deformable DETR model and criterion classes.
+"""
 import torch
 import torch.nn.functional as F
 from torch import nn
 import math
-
+import pickle
 from util import box_ops
 from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        accuracy, get_world_size, interpolate,
                        is_dist_avail_and_initialized, inverse_sigmoid)
-
 from .ResNet_50 import build_backbone
-from .DeformableTransformer import build_deforamble_transformer
 from .HungarianMatcher import build_matcher
 from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
                            dice_loss, sigmoid_focal_loss)
-
+from .DeformableTransformer import build_deforamble_transformer
 import copy
+import heapq
+import operator
+import os
+from copy import deepcopy
 
 
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
-class MLP(nn.Module):
-    """ Very simple multi-layer perceptron (also called FFN)"""
-
-    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
-        super().__init__()
-        self.num_layers = num_layers
-        h = [hidden_dim] * (num_layers - 1)
-        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
-
-    def forward(self, x):
-        for i, layer in enumerate(self.layers):
-            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
-        return x
-
 
 class DeformableDETR(nn.Module):
-    """ This is the Deformable DETR module that performs object detection """
-    def    __init__(self, backbone, transformer, num_classes, num_queries, num_feature_levels,
-                 aux_loss=True, with_box_refine=False):
-        """ Initializes the model.
-        Parameters:
-            backbone: torch module of the backbone to be used. See backbone.py
-            transformer: torch module of the transformer architecture. See transformer.py
-            num_classes: number of object classes
-            num_queries: number of object queries, ie detection slot. This is the maximal number of objects
-                         DETR can detect in a single image. For COCO, we recommend 100 queries.
-            aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
-            with_box_refine: iterative bounding box refinement
+    """
+    This is the Deformable DETR module that performs object detection
+    """
+    def __init__(self, backbone, transformer, n_classes, n_queries, n_feature_levels,
+                 aux_loss=True, with_box_refine=False, unmatched_boxes=False, if_obj_cls=False, d_feature=1024):
+        """
+        Initializes the model.
+        :param backbone: torch module of the backbone to be used. See backbone.py
+        :param transformer: torch module of the transformer architecture. See transformer.py
+        :param n_classes: number of object classes
+        :param n_queries: number of object queries, ie detection slot. This is the maximal number of objects
+                            DETR can detect in a single image. For COCO, we recommend 100 queries.
+        :param n_feature_levels: number of feature levels
+        :param aux_loss: True if auxiliary decoding losses (loss at each decoder layer) are to be used.
+        :param with_box_refine: iterative bounding box refinement
         """
         super().__init__()
-
         d_model = transformer.d_model
-        self.num_queries = num_queries
-        self.n_levels = num_feature_levels
 
-        # self.query_embed网络：把每个query编码成2 * d_model的向量，前半段为常规embedding，后半段为pos_embedding
-        self.query_embed = nn.Embedding(num_queries, d_model * 2)
+        self.n_queries = n_queries
+        self.n_feature_levels = n_feature_levels
+        self.d_feature = d_feature
+
         self.transformer = transformer
         self.backbone = backbone
-        self.class_predictor = nn.Linear(d_model, num_classes)
-        # 多层感知机，用transformer输出的注意力向量预测框的坐标
-        # __init__(self, input_dim, hidden_dim, output_dim, num_layers): output.size(x,y,w,h)
+
+        # class预测头,用transformer输出的注意力向量预测query的类别
+        self.class_predictor = nn.Linear(d_model, n_classes)
+        # bbox预测头,用transformer输出的注意力向量预测query的bbox坐标
         self.bbox_predictor = MLP(d_model, d_model, 4, 3)
+        self.unmatched_boxes = unmatched_boxes
+        self.obj_cls = if_obj_cls
+        # objectiveness预测头, separate the foreground objects (known and unknown) from the background
+        if self.obj_cls:
+            self.obj_predictor = nn.Linear(d_model, 1)
+        # self.query_embed网络：把每个query编码成2 * d_model的向量，前半段为常规embedding，后半段为pos_embedding
+        self.query_embed = nn.Embedding(n_queries, d_model * 2)
 
-
-        if num_feature_levels > 1:
+        if n_feature_levels > 1:
             n_resolutions = backbone.n_resolutions
             channel_convertor = []
             # 对于通过不同步长卷积输出的不同尺度的特征图（C3,C4,C5）,通过1*1卷积核将不同大小的in_channels转换为统一的hidden_dim(即d_model)
@@ -90,165 +90,267 @@ class DeformableDETR(nn.Module):
                     nn.Conv2d(backbone.n_channels[0], d_model, kernel_size=1),
                     nn.GroupNorm(32, d_model),
                 )])
-
         self.aux_loss = aux_loss
         self.with_box_refine = with_box_refine
 
-        # 先验概率
+        # 初始化参数
         prior_prob = 0.01
         bias_value = -math.log((1 - prior_prob) / prior_prob)
-        # 初始化self.class_embed网络的偏置
-        self.class_predictor.bias.data = torch.ones(num_classes) * bias_value
-        # 用0初始化self.bbox_embed（MLP）最后一个线性层的权重和偏置
+        self.class_predictor.bias.data = torch.ones(n_classes) * bias_value
+        if self.obj_cls:
+            self.obj_predictor.bias.data = torch.ones(1) * bias_value
         nn.init.constant_(self.bbox_predictor.layers[-1].weight.data, 0)
         nn.init.constant_(self.bbox_predictor.layers[-1].bias.data, 0)
-        for proj in self.channel_convertor:
+        for proj in self.input_proj:
             nn.init.xavier_uniform_(proj[0].weight, gain=1)
             nn.init.constant_(proj[0].bias, 0)
 
-        # if two-stage, the last class_embed and bbox_embed is for region proposal generation
-        # 如果是两阶段模型，输出decoder层数+1个预测，否则每层输出一个预测
-        n_pred = transformer.decoder.n_layers
+
+        n_pred = transformer.decoder.num_layers
         if with_box_refine:
-            # 为每个decoder_layer设置一个self.bbox_embed,利用每个decoder_layer的输出向量来预测一次候选框
+            # 深拷贝,为每个decoder每一层设置一个bbox_predictor和class_predictor,利用decoder每一层的输出向量来预测一次类别+框坐标
             self.class_predictor = _get_clones(self.class_predictor, n_pred)
             self.bbox_predictor = _get_clones(self.bbox_predictor, n_pred)
             nn.init.constant_(self.bbox_predictor[0].layers[-1].bias.data[2:], -2.0)
-            # hack implementation for iterative bounding box refinement
             self.transformer.decoder.bbox_embed = self.bbox_predictor
         else:
+            # 浅拷贝,多层bbox_predictor和class_predictor共享参数以实现接口一致性, 随着训练同时变化参数，相当一个网络
             nn.init.constant_(self.bbox_predictor.layers[-1].bias.data[2:], -2.0)
-            # decoder每一层的输出通过一个self.class_embed网络，预测一次类别+框坐标
-            # 每一层class_embed和bbox_embed为浅拷贝, 共享参数, 随着训练同时变化参数，即对每一层使用同样的网络预测
             self.class_predictor = nn.ModuleList([self.class_predictor for _ in range(n_pred)])
+            if self.obj_cls:
+                self.obj_predictor = nn.ModuleList([self.nc_class_embed for _ in range(n_pred)])
             self.bbox_predictor = nn.ModuleList([self.bbox_predictor for _ in range(n_pred)])
             self.transformer.decoder.bbox_embed = None
 
     def forward(self, samples: NestedTensor):
-        """ The forward expects a NestedTensor, which consists of:
-               - samples.tensor: batched images, of shape [batch_size x 3 x H x W]
-               - samples.mask: a binary mask of shape [batch_size x H x W], containing 1 on padded pixels
+        """
+        The forward expects a NestedTensor, which consists of:
+        :param samples.tensor: batched images, of shape [bs,3,H,W]
+        :param samples.mask:  binary mask of shape [bs,H,W], containing 1 on padded pixels
 
-            It returns a dict with the following elements:
-               - "pred_logits": the classification logits (including no-object) for all queries.
-                                Shape= [batch_size x num_queries x (num_classes + 1)]
-               - "pred_boxes": The normalized boxes coordinates for all queries, represented as
-                               (center_x, center_y, height, width). These values are normalized in [0, 1],
-                               relative to the size of each individual image (disregarding possible padding).
-                               See PostProcess for information on how to retrieve the unnormalized bounding box.
-               - "aux_outputs": Optional, only returned when auxilary losses are activated. It is a list of
-                                dictionnaries containing the two above keys for each decoder layer.
+        :return out: a dict which consists of:
+        "pred_logits": classification logits including no-object for all queries, of shape [bs,n_queries,(n_classes+1)]
+        "pred_boxes":  relative bboxes coordinates for all queries, of shape [bs,n_queries,(x, y, h, w)]
+                       These values are normalized in [0, 1],relative to the size of each individual image .
+                       See PostProcess for information on how to retrieve the absolute bbox coordinates.
+        "aux_outputs": a list of dicts containing the {"pred_logits","pred_boxes"} for each decoder layer.
         """
         if not isinstance(samples, NestedTensor):
             samples = nested_tensor_from_tensor_list(samples)
-        # 由backbone得到src、mask、pos
-        feature_maps, pos = self.backbone(samples)
 
+        """In this part, backbone take the samples as inout and output the features and pos embeds."""
+        # images输入backbone产生不同level的特征图和位置编码
+        features, pos = self.backbone(samples)
+
+        """In this part, prepare features and pos embeds for the transformer."""
         srcs = []
         masks = []
-        # 将backbone输出的不同尺度不同channel的特征图————>深度均为d_model的几个不同尺度的特征图及其掩码矩阵
-        for l, feature_map in enumerate(feature_maps):
+        if self.d_feature == 512:
+            dim_index = 0
+        elif self.d_feature == 1024:
+            dim_index = 1
+        else:
+            dim_index = 2
+
+        # 提取每一尺度的特征图, 将它们转换到相同channel dimension
+        for level, feature_map in enumerate(features):
             src, mask = feature_map.decompose()
-            srcs.append(self.channel_convertor[l](src))
+            # extracting the resnet features which are used for selecting unmatched queries
+            if self.unmatched_boxes:
+                if level == dim_index:
+                    resnet_1024_feature = src.clone()  # [2,1024,61,67]
+            else:
+                resnet_1024_feature = None
+            # 将每个level的特征图的channel维度映射到同一维度d_model
+            srcs.append(self.input_proj[level](src))
             masks.append(mask)
             assert mask is not None
 
-        # 如果DDETR的特征图尺度数多于backbone输出的特征图尺度数，多出来的新尺度特征图由srcs的最后一个尺度的特征图卷积得到
-        # 掩码矩阵由输入图片（samples）的mask插值得到
-        if self.n_levels > len(srcs):
+        # 如果backbone产生的特征图数少于DDETR预设的尺度数，利用backbone最小分辨率的特征图(最后一层的输出)进行等尺度映射, 补足特征图数量
+        if self.n_feature_levels > len(srcs):
             _len_srcs = len(srcs)
-            for l in range(_len_srcs, self.n_levels):
-                if l == _len_srcs:
-                    src = self.channel_convertor[l](feature_maps[-1].tensors)
+            for level in range(_len_srcs, self.n_feature_levels):
+                if level == _len_srcs:
+                    src = self.input_proj[level](features[-1].tensors)
                 else:
-                    src = self.channel_convertor[l](srcs[-1])
+                    src = self.input_proj[level](srcs[-1])
                 m = samples.mask
                 mask = F.interpolate(m[None].float(), size=src.shape[-2:]).to(torch.bool)[0]
-                pos_l = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
+                pos_level = self.backbone[1](NestedTensor(src, mask)).to(src.dtype)
                 srcs.append(src)
                 masks.append(mask)
-                pos.append(pos_l)
+                pos.append(pos_level)
 
         query_embeds = self.query_embed.weight
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coordinate = self.transformer(srcs, masks, pos, query_embeds)
 
+        """In this part, the transformer takes prepared features, pos embeds and queries as input and output the class
+           and bbox coordinates of the queries."""
+        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+            self.transformer(srcs, masks, pos, query_embeds)
         outputs_classes = []
-        outputs_coordinates = []
+        outputs_coords = []
+        outputs_classes_obj = []
+
         for layer in range(hs.shape[0]):
+            # 提取当前层的参考点
             if layer == 0:
                 reference = init_reference
             else:
                 reference = inter_references[layer - 1]
             reference = inverse_sigmoid(reference)
+
+            # 用decoder当前层输出向量预测类别
             outputs_class = self.class_predictor[layer](hs[layer])
+
+            # 用decoder当前层输出向量预测前景概率(objectiveness)
+            if self.obj_cls:
+                outputs_class_obj = self.obj_predictor[layer](hs[layer])
+
+            # 用decoder当前层输出向量预测bbox坐标
             tmp = self.bbox_predictor[layer](hs[layer])
             if reference.shape[-1] == 4:
                 tmp += reference
             else:
                 assert reference.shape[-1] == 2
                 tmp[..., :2] += reference
-            outputs_coordinate = tmp.sigmoid()
-            outputs_classes.append(outputs_class)
-            outputs_coordinates.append(outputs_coordinate)
-        outputs_class = torch.stack(outputs_classes)
-        outputs_coordinate = torch.stack(outputs_coordinate)
+            outputs_coord = tmp.sigmoid()
 
-        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coordinate[-1]}
+            # 存储当前层的预测（类别、bbox坐标，objectiveness）
+            outputs_classes.append(outputs_class)
+            if self.obj_cls:
+                outputs_classes_obj.append(outputs_class_obj)
+            outputs_coords.append(outputs_coord)
+
+        outputs_class = torch.stack(outputs_classes)
+        outputs_coord = torch.stack(outputs_coords)
+        if self.obj_cls:
+            output_class_obj = torch.stack(outputs_classes_obj)
+
+        """
+        out is a dict which contains:
+         {
+         'pred_logits': category
+         'pred_nc_logits': obj or background
+         'pred_boxes': bbox coordinates
+         'resnet_1024_feat': feature map of resnet with 1024 channels
+         }
+        """
+        out = {'pred_logits': outputs_class[-1], 'pred_boxes': outputs_coord[-1], 'resnet_1024_feat': resnet_1024_feature}
+
+        if self.obj_cls:
+            out = {'pred_logits': outputs_class[-1], 'pred_nc_logits': output_class_obj[-1],
+                   'pred_boxes': outputs_coord[-1], 'resnet_1024_feat': resnet_1024_feature}
+
         if self.aux_loss:
-            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coordinate)
+            out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, output_class_obj=None)
+            if self.obj_cls:
+                out['aux_outputs'] = self._set_aux_loss(outputs_class, outputs_coord, output_class_obj=output_class_obj)
 
         return out
 
     @torch.jit.unused
-    def _set_aux_loss(self, outputs_class, outputs_coord):
-        # this is a workaround to make torchscript happy, as torchscript
+    def _set_aux_loss(self, outputs_class, outputs_coord, output_class_obj=None):
         # doesn't support dictionary with non-homogeneous values, such
         # as a dict having both a Tensor and a list.
-        return [{'pred_logits': a, 'pred_boxes': b}
-                for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+        # import pdb;pdb.set_trace()
+        if output_class_obj is not None:
+            xx = [{'pred_logits': a, 'pred_nc_logits': c, 'pred_boxes': b}
+                  for a, c, b in zip(outputs_class[:-1], output_class_obj[:-1], outputs_coord[:-1])]
+        else:
+            xx = [{'pred_logits': a, 'pred_boxes': b}
+                  for a, b in zip(outputs_class[:-1], outputs_coord[:-1])]
+        return xx
 
 
 class SetCriterion(nn.Module):
     """
     This class computes the loss for DETR.
-    The process happens at two steps:
+    The process happens in two steps:
     1) we compute hungarian assignment between ground truth boxes and the outputs of the model
     2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
-    def __init__(self, num_classes, matcher, weight_dict, losses, focal_alpha=0.25):
-        """ Create the criterion.
+
+    def __init__(self, args, num_classes, matcher, weight_dict, losses, num_seen_classes, invalid_cls_logits):
+        """
+        Create the criterion.
         :param num_classes: number of object categories, omitting the special no-object category
         :param matcher: module able to compute a matching between targets and proposals
         :param weight_dict: [losses:weight].
         :param losses: list of all the losses to be applied. See get_loss for list of available losses.
         :param focal_alpha: alpha in Focal Loss
+        :param invalid_cls_logits:
         """
         super().__init__()
         self.num_classes = num_classes
         self.matcher = matcher
         self.weight_dict = weight_dict
         self.losses = losses
-        self.focal_alpha = focal_alpha
+        self.focal_alpha = args.focal_alpha
+        self.nc_epoch = args.nc_epoch
+        self.output_dir = args.output_dir
+        self.invalid_cls_logits = invalid_cls_logits
+        self.unmatched_boxes = args.unmatched_boxes
+        self.top_unk = args.top_unk
+        self.bbox_thresh = args.bbox_thresh
+        self.num_seen_classes = num_seen_classes
 
-    def loss_labels(self, outputs, targets, indices, num_boxes, log=True):
-        """Classification loss (NLL)
-        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+    def loss_NC_labels(self, outputs, targets, indices, num_boxes, current_epoch, owod_targets, owod_indices, log=True):
         """
-        assert 'pred_logits' in outputs
-        src_logits = outputs['pred_logits']
+        Novelty classification loss
+        target labels will contain class as 1
+        owod_indices -> indices combining matched indices + psuedo labeled indices
+        owod_targets -> targets combining GT targets + psuedo labeled unknown targets
+        target_classes_o -> contains all 1's
+        """
+        assert 'pred_nc_logits' in outputs
+        src_logits = outputs['pred_nc_logits']
 
-        idx = self._get_src_permutation_idx(indices)
-        target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
-        target_classes = torch.full(src_logits.shape[:2], self.num_classes,
-                                    dtype=torch.int64, device=src_logits.device)
+        idx = self._get_src_permutation_idx(owod_indices)
+
+        # 将预测为objective(1)的proposal的class设置为1
+        target_classes = torch.full(src_logits.shape[:2], 1, dtype=torch.int64, device=src_logits.device)
+        # 将预测为background(0)的proposal的class设置为0
+        target_classes_o = torch.cat([torch.full_like(t["labels"][J], 0) for t, (_, J) in zip(owod_targets, owod_indices)])
         target_classes[idx] = target_classes_o
 
         target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
                                             dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
         target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
 
-        target_classes_onehot = target_classes_onehot[:,:,:-1]
-        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * src_logits.shape[1]
+        target_classes_onehot = target_classes_onehot[:, :, :-1]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * \
+                  src_logits.shape[1]
+
+        losses = {'loss_NC': loss_ce}
+        return losses
+
+    def loss_labels(self, outputs, targets, indices, num_boxes, current_epoch, owod_targets, owod_indices, log=True):
+        """
+        Classification loss (NLL)
+        targets dicts must contain the key "labels" containing a tensor of dim [nb_target_boxes]
+        """
+        assert 'pred_logits' in outputs
+        ## comment lines from 317-320 when running for oracle settings
+        temp_src_logits = outputs['pred_logits'].clone()
+        temp_src_logits[:, :, self.invalid_cls_logits] = -10e10
+        src_logits = temp_src_logits
+
+        if self.unmatched_boxes:
+            idx = self._get_src_permutation_idx(owod_indices)
+            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(owod_targets, owod_indices)])
+        else:
+            idx = self._get_src_permutation_idx(indices)
+            target_classes_o = torch.cat([t["labels"][J] for t, (_, J) in zip(targets, indices)])
+
+        target_classes = torch.full(src_logits.shape[:2], self.num_classes, dtype=torch.int64, device=src_logits.device)
+        target_classes[idx] = target_classes_o
+        target_classes_onehot = torch.zeros([src_logits.shape[0], src_logits.shape[1], src_logits.shape[2] + 1],
+                                            dtype=src_logits.dtype, layout=src_logits.layout, device=src_logits.device)
+        target_classes_onehot.scatter_(2, target_classes.unsqueeze(-1), 1)
+        target_classes_onehot = target_classes_onehot[:, :, :-1]
+        loss_ce = sigmoid_focal_loss(src_logits, target_classes_onehot, num_boxes, alpha=self.focal_alpha, gamma=2) * \
+                  src_logits.shape[1]
+
         losses = {'loss_ce': loss_ce}
 
         if log:
@@ -257,24 +359,34 @@ class SetCriterion(nn.Module):
         return losses
 
     @torch.no_grad()
-    def loss_cardinality(self, outputs, targets, indices, num_boxes):
-        """ Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
+    def loss_cardinality(self, outputs, targets, indices, num_boxes, current_epoch, owod_targets, owod_indices):
+        """
+        Compute the cardinality error, ie the absolute error in the number of predicted non-empty boxes
         This is not really a loss, it is intended for logging purposes only. It doesn't propagate gradients
         """
-        pred_logits = outputs['pred_logits']
+        temp_pred_logits = outputs['pred_logits'].clone()
+        temp_pred_logits[:, :, self.invalid_cls_logits] = -10e10
+        pred_logits = temp_pred_logits
+
         device = pred_logits.device
-        tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
+        if self.unmatched_boxes:
+            tgt_lengths = torch.as_tensor([len(v["labels"]) for v in owod_targets], device=device)
+        else:
+            tgt_lengths = torch.as_tensor([len(v["labels"]) for v in targets], device=device)
         # Count the number of predictions that are NOT "no-object" (which is the last class)
         card_pred = (pred_logits.argmax(-1) != pred_logits.shape[-1] - 1).sum(1)
         card_err = F.l1_loss(card_pred.float(), tgt_lengths.float())
         losses = {'cardinality_error': card_err}
         return losses
 
-    def loss_boxes(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
-           targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
-           The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
+    def loss_boxes(self, outputs, targets, indices, num_boxes, current_epoch, owod_targets, owod_indices):
+        # def loss_boxes(self, outputs, targets, indices, num_boxes, current_epoch, owod_targets, owod_indices, ca_owod_targets, ca_owod_indices):
         """
+        Compute the losses related to the bounding boxes, the L1 regression loss and the GIoU loss
+        targets dicts must contain the key "boxes" containing a tensor of dim [nb_target_boxes, 4]
+        The target boxes are expected in format (center_x, center_y, h, w), normalized by the image size.
+        """
+
         assert 'pred_boxes' in outputs
         idx = self._get_src_permutation_idx(indices)
         src_boxes = outputs['pred_boxes'][idx]
@@ -291,39 +403,28 @@ class SetCriterion(nn.Module):
         losses['loss_giou'] = loss_giou.sum() / num_boxes
         return losses
 
-    def loss_masks(self, outputs, targets, indices, num_boxes):
-        """Compute the losses related to the masks: the focal loss and the dice loss.
-           targets dicts must contain the key "masks" containing a tensor of dim [nb_target_boxes, h, w]
-        """
-        assert "pred_masks" in outputs
+    def save_dict(self, di_, filename_):
+        with open(filename_, 'wb') as f:
+            pickle.dump(di_, f)
 
-        src_idx = self._get_src_permutation_idx(indices)
-        tgt_idx = self._get_tgt_permutation_idx(indices)
-
-        src_masks = outputs["pred_masks"]
-
-        # TODO use valid to mask invalid areas due to padding in loss
-        target_masks, valid = nested_tensor_from_tensor_list([t["masks"] for t in targets]).decompose()
-        target_masks = target_masks.to(src_masks)
-
-        src_masks = src_masks[src_idx]
-        # upsample predictions to the target size
-        src_masks = interpolate(src_masks[:, None], size=target_masks.shape[-2:],
-                                mode="bilinear", align_corners=False)
-        src_masks = src_masks[:, 0].flatten(1)
-
-        target_masks = target_masks[tgt_idx].flatten(1)
-
-        losses = {
-            "loss_mask": sigmoid_focal_loss(src_masks, target_masks, num_boxes),
-            "loss_dice": dice_loss(src_masks, target_masks, num_boxes),
-        }
-        return losses
+    def load_dict(self, filename_):
+        with open(filename_, 'rb') as f:
+            ret_dict = pickle.load(f)
+        return ret_dict
 
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
         src_idx = torch.cat([src for (src, _) in indices])
+        return batch_idx, src_idx
+
+    def _get_src_single_permutation_idx(self, indices, index):
+        # indices: tuple(index_i,index_j)
+        # Only need the src query index selection from this function for attention feature selection
+        # i: the index of matching
+        # src: the tuples(i,j)
+        batch_idx = [torch.full_like(src, i) for i, src in enumerate(indices)][0]
+        src_idx = indices[0]
         return batch_idx, src_idx
 
     def _get_tgt_permutation_idx(self, indices):
@@ -332,74 +433,187 @@ class SetCriterion(nn.Module):
         tgt_idx = torch.cat([tgt for (_, tgt) in indices])
         return batch_idx, tgt_idx
 
-    def get_loss(self, loss, outputs, targets, indices, num_boxes, **kwargs):
-        # dict that index the different loss computation method
+    def get_loss(self, loss, outputs, targets, indices, num_boxes, epoch, owod_targets, owod_indices, **kwargs):
         loss_map = {
             'labels': self.loss_labels,
+            'NC_labels': self.loss_NC_labels,
             'cardinality': self.loss_cardinality,
             'boxes': self.loss_boxes,
-            'masks': self.loss_masks
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
-        return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+        return loss_map[loss](outputs, targets, indices, num_boxes, epoch, owod_targets, owod_indices, **kwargs)
 
-    def forward(self, outputs, targets):
+    def forward(self, samples, outputs, targets, epoch):
         """
         This performs the loss computation.
         :param outputs: A dict of tensors, see the output specification of the model for the format
         :param targets: A list of dicts, such that len(targets) == batch_size.
 
         :return losses: A dict as followed:
-                {'loss_ce': ,
-                 'cardinality_error': ,
-                 'loss_giou': ,
+                {'loss_ce':,
+                 'cardinality_error':,
+                 'loss_giou':,
+                 'loss_NC'
                 }
         """
-        # 存储decoder最后一层的输出
+        # DDETR输出字典
+        # outputs_without_aux{'pred_logits', 'pred_nc_logits', 'pred_boxes', 'resnet_1024_feat'}
         outputs_without_aux = {k: v for k, v in outputs.items() if k != 'aux_outputs' and k != 'enc_outputs'}
-
-        # Retrieve the matching between the outputs of the last layer and the targets
+        # 元组列表[(index_i,index_j)..,(index_i,index_j)],每一张图片匹配到的proposals(index_i)和target(index_j)的索引
         indices = self.matcher(outputs_without_aux, targets)
+        owod_targets = deepcopy(targets)
+        owod_indices = deepcopy(indices)
+        owod_outputs = outputs_without_aux.copy()
+        owod_device = owod_outputs["pred_boxes"].device
 
-        # 将batch中每张img的target bboxes求和得到batch的总target bbox数量
+        """
+        When the train epoch > 9, generate pseudo targets from the unmatched bboxes of which activation are stronger.
+        In this part, get unmatched boxes as pseudo labels
+        """
+        if self.unmatched_boxes and epoch >= self.nc_epoch:
+            # feature heatmap，表示每个像素在所有通道上的平均激活强度，of size(bs,h,w)
+            res_feat = torch.mean(outputs['resnet_1024_feat'], 1)
+            # 根据一张img的query数量来生成从0到99的100个query
+            all_indices = torch.arange(outputs['pred_logits'].shape[1])
+
+            # i:img index in a batch, 循环处理每张图片
+            for i in range(len(indices)):
+                # 求所有query和matched query的差集，即unmatched query的索引
+                matched_indices = indices[i][0]
+                combined = torch.cat((all_indices, matched_indices))
+                uniques, counts = combined.unique(return_counts=True)
+                unmatched_indices = uniques[counts == 1]
+
+                # boxes: the coordinates of each bbox in the ith img, of size(n_queries,4)
+                boxes = outputs_without_aux['pred_boxes'][i]
+                img = samples.tensors[i].cpu().permute(1, 2, 0).numpy()
+                h, w = img.shape[:-1]
+                img_w = torch.tensor(w, device=owod_device)
+                img_h = torch.tensor(h, device=owod_device)
+                # 将bbox的坐标(x,y,h,w)转换为左下角(x,y)和右上角坐标(x,y)
+                unmatched_boxes = box_ops.box_cxcywh_to_xyxy(boxes)
+                unmatched_boxes = unmatched_boxes * torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float32).to(
+                    owod_device)
+                # 生成n_queries长度的零向量
+                means_bb = torch.zeros(all_indices.shape[0]).to(unmatched_boxes)
+
+                bb = unmatched_boxes
+                for j, _ in enumerate(means_bb):
+                    if j in unmatched_indices:
+                        # 上采样网络, 对feature heatmap线性插值扩大到img的分辨率, 输出分辨率(img_h, img_w)
+                        upsample = nn.Upsample(size=(img_h, img_w), mode='bilinear')
+                        # 扩张为size:(bs,c,h,w)->img_feat:(1,1,h,w),进行线性插值
+                        img_feat = upsample(res_feat[i].unsqueeze(0).unsqueeze(0))
+                        # img_feat:(img_h,img_w)
+                        img_feat = img_feat.squeeze(0).squeeze(0)
+                        # bbox左下角和右上角的坐标
+                        xmin = bb[j, :][0].long()
+                        ymin = bb[j, :][1].long()
+                        xmax = bb[j, :][2].long()
+                        ymax = bb[j, :][3].long()
+                        # 对于匹配到的bbox，计算每张图片feature heatmap中bbox左下角和右上角之间的平均激活强度
+                        means_bb[j] = torch.mean(img_feat[ymin:ymax, xmin:xmax])
+                        if torch.isnan(means_bb[j]):
+                            means_bb[j] = -10e10
+                    else:
+                        # 对于未匹配到的bbox,平均激活强度记为极大负值
+                        means_bb[j] = -10e10
+
+                # 选取平均激活强度最大的前k个未匹配bbox,topl_inds存储0-99之间的bbox索引
+                _, topk_inds = torch.topk(means_bb, self.top_unk)
+                topk_inds = torch.as_tensor(topk_inds)
+                topk_inds = topk_inds.cpu()
+
+                # 将unknown obj bbox的label设为最后一类
+                unk_label = torch.as_tensor([self.num_classes - 1], device=owod_device)
+                # 增加top_unk个pseudo labels
+                owod_targets[i]['labels'] = torch.cat(
+                    (owod_targets[i]['labels'], unk_label.repeat_interleave(self.top_unk)))
+                # 扩展这张img的匹配索引,index_i和index_j分别增加top_unk个索引
+                owod_indices[i] = (torch.cat((owod_indices[i][0], topk_inds)), torch.cat(
+                    (owod_indices[i][1], (owod_targets[i]['labels'] == unk_label).nonzero(as_tuple=True)[0].cpu())))
+
+        # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
         num_boxes = torch.as_tensor([num_boxes], dtype=torch.float, device=next(iter(outputs.values())).device)
         if is_dist_avail_and_initialized():
             torch.distributed.all_reduce(num_boxes)
-        # 计算每个节点上的平均target bbox数量
+        # 计算分配到每个节点上的平均target bbox数量
         num_boxes = torch.clamp(num_boxes / get_world_size(), min=1).item()
 
-        # Compute all the requested losses
+        # 计算所有要求的loss，存储在字典losses
         losses = {}
         for loss in self.losses:
             kwargs = {}
-            losses.update(self.get_loss(loss, outputs, targets, indices, num_boxes, **kwargs))
+            losses.update(
+                self.get_loss(loss, outputs, targets, indices, num_boxes, epoch, owod_targets, owod_indices, **kwargs))
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
             for i, aux_outputs in enumerate(outputs['aux_outputs']):
                 indices = self.matcher(aux_outputs, targets)
+
+                owod_targets = deepcopy(targets)
+                owod_indices = deepcopy(indices)
+
+                aux_owod_outputs = aux_outputs.copy()
+                owod_device = aux_owod_outputs["pred_boxes"].device
+
+                if self.unmatched_boxes and epoch >= self.nc_epoch:
+                    ## get pseudo unmatched boxes from this section
+                    res_feat = torch.mean(outputs['resnet_1024_feat'], 1)  # 2 X 67 X 50
+                    queries = torch.arange(aux_owod_outputs['pred_logits'].shape[1])
+                    for i in range(len(indices)):
+                        combined = torch.cat((queries, self._get_src_single_permutation_idx(indices[i], i)[
+                            -1]))  ## need to fix the indexing
+                        uniques, counts = combined.unique(return_counts=True)
+                        unmatched_indices = uniques[counts == 1]
+                        boxes = aux_owod_outputs['pred_boxes'][i]  # [unmatched_indices,:]
+                        img = samples.tensors[i].cpu().permute(1, 2, 0).numpy()
+                        h, w = img.shape[:-1]
+                        img_w = torch.tensor(w, device=owod_device)
+                        img_h = torch.tensor(h, device=owod_device)
+                        unmatched_boxes = box_ops.box_cxcywh_to_xyxy(boxes)
+                        unmatched_boxes = unmatched_boxes * torch.tensor([img_w, img_h, img_w, img_h],
+                                                                         dtype=torch.float32).to(owod_device)
+                        means_bb = torch.zeros(queries.shape[0]).to(
+                            unmatched_boxes)  # torch.zeros(unmatched_boxes.shape[0])
+                        bb = unmatched_boxes
+                        ## [INFO]: iterating over the full list of boxes and then selecting the unmatched ones
+                        for j, _ in enumerate(means_bb):
+                            if j in unmatched_indices:
+                                upsaple = nn.Upsample(size=(img_h, img_w), mode='bilinear')
+                                img_feat = upsaple(res_feat[i].unsqueeze(0).unsqueeze(0))
+                                img_feat = img_feat.squeeze(0).squeeze(0)
+                                xmin = bb[j, :][0].long()
+                                ymin = bb[j, :][1].long()
+                                xmax = bb[j, :][2].long()
+                                ymax = bb[j, :][3].long()
+                                means_bb[j] = torch.mean(img_feat[ymin:ymax, xmin:xmax])
+                                if torch.isnan(means_bb[j]):
+                                    means_bb[j] = -10e10
+                            else:
+                                means_bb[j] = -10e10
+
+                        _, topk_inds = torch.topk(means_bb, self.top_unk)
+                        topk_inds = torch.as_tensor(topk_inds)
+
+                        topk_inds = topk_inds.cpu()
+                        unk_label = torch.as_tensor([self.num_classes - 1], device=owod_device)
+                        owod_targets[i]['labels'] = torch.cat(
+                            (owod_targets[i]['labels'], unk_label.repeat_interleave(self.top_unk)))
+                        owod_indices[i] = (torch.cat((owod_indices[i][0], topk_inds)), torch.cat((owod_indices[i][1], (
+                                    owod_targets[i]['labels'] == unk_label).nonzero(as_tuple=True)[0].cpu())))
+
                 for loss in self.losses:
-                    if loss == 'masks':
-                        # Intermediate masks losses are too costly to compute, we ignore them.
-                        continue
                     kwargs = {}
                     if loss == 'labels':
                         # Logging is enabled only for the last layer
                         kwargs['log'] = False
-                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, **kwargs)
+                    l_dict = self.get_loss(loss, aux_outputs, targets, indices, num_boxes, epoch, owod_targets,
+                                           owod_indices, **kwargs)
                     l_dict = {k + f'_{i}': v for k, v in l_dict.items()}
                     losses.update(l_dict)
-        """
-        {'loss_ce_0':,
-        'cardinality_error_0':,
-        'loss_giou_0':,
-        ...
-        'loss_ce_4':,
-        'cardinality_error_4':,
-        'loss_giou_4':,
-        }
-        """
 
         if 'enc_outputs' in outputs:
             enc_outputs = outputs['enc_outputs']
@@ -408,9 +622,6 @@ class SetCriterion(nn.Module):
                 bt['labels'] = torch.zeros_like(bt['labels'])
             indices = self.matcher(enc_outputs, bin_targets)
             for loss in self.losses:
-                if loss == 'masks':
-                    # Intermediate masks losses are too costly to compute, we ignore them.
-                    continue
                 kwargs = {}
                 if loss == 'labels':
                     # Logging is enabled only for the last layer
@@ -421,16 +632,11 @@ class SetCriterion(nn.Module):
 
         return losses
 
-        """
-        {'loss_ce_enc':,
-        'cardinality_error_enc':,
-        'loss_giou_enc':,
-        """
-
-
 
 class PostProcess(nn.Module):
-    """ This module converts the model's output into the format expected by the coco api"""
+    """
+    This module converts the model's output into the format expected by the coco api
+    """
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
@@ -452,7 +658,7 @@ class PostProcess(nn.Module):
         topk_boxes = topk_indexes // out_logits.shape[2]
         labels = topk_indexes % out_logits.shape[2]
         boxes = box_ops.box_cxcywh_to_xyxy(out_bbox)
-        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1,1,4))
+        boxes = torch.gather(boxes, 1, topk_boxes.unsqueeze(-1).repeat(1, 1, 4))
 
         # and from relative [0, 1] to absolute [0, height] coordinates
         img_h, img_w = target_sizes.unbind(1)
@@ -464,12 +670,23 @@ class PostProcess(nn.Module):
         return results
 
 
+class MLP(nn.Module):
+    """ Very simple multi-layer perceptron (also called FFN)"""
+
+    def __init__(self, input_dim, hidden_dim, output_dim, num_layers):
+        super().__init__()
+        self.num_layers = num_layers
+        h = [hidden_dim] * (num_layers - 1)
+        self.layers = nn.ModuleList(nn.Linear(n, k) for n, k in zip([input_dim] + h, h + [output_dim]))
+
+    def forward(self, x):
+        for i, layer in enumerate(self.layers):
+            x = F.relu(layer(x)) if i < self.num_layers - 1 else layer(x)
+        return x
 
 
 def build_OWDETR(args):
-
-    # 为模型指定分类的类别数量
-    num_classes = 91
+    num_classes = args.num_classes
     device = torch.device(args.device)
     """
     Construct the 2-block model, which consists of a backbone and a deformable transformer
@@ -478,68 +695,60 @@ def build_OWDETR(args):
     :param num_feature_levels=4
     :param aux_loss=True: add intermediate loss in the decoder
     :param with_box_refine=False
+    :param if_obj_cls: if introduce obj classification branch
     """
     backbone = build_backbone(args)
     transformer = build_deforamble_transformer(args)
     model = DeformableDETR(
         backbone,
         transformer,
-        num_classes=num_classes,
-        num_queries=args.num_queries,
-        num_feature_levels=args.num_feature_levels,
+        n_classes=num_classes,
+        n_queries=args.num_queries,
+        n_feature_levels=args.num_feature_levels,
         aux_loss=args.aux_loss,
         with_box_refine=args.with_box_refine,
+        unmatched_boxes=args.unmatched_boxes,
+        if_obj_cls=args.NC_branch,
+        d_feature=args.featdim,
     )
     model.to(device)
-
     """
     Construct the criterion branch, which computes the loss.
     """
-    # 初始化匹配器
-    matcher = build_matcher(args)
-    # 创建字典记录三部分损失：class loss, bonding box loss, giou loss
-    weight_dict = {'loss_cls': args.cls_loss_coef,
+    # 准备loss的权重字典
+    weight_dict = {'loss_ce': args.cls_loss_coef,
                    'loss_bbox': args.bbox_loss_coef,
-                   'loss_giou': args.giou_loss_coef}
-    # TODO this is a hack
-    # 创建字典记录decoder每一层输出的损失名称及其权重
-
-    # 如果加入aux loss
-    if not args.no_aux_loss:
+                   'loss giou': args.giou_loss_coef}
+    if args.NC_branch:
+        weight_dict = {'loss_ce': args.cls_loss_coef,
+                       'loss_NC': args.nc_loss_coef,
+                       'loss_bbox': args.bbox_loss_coef,
+                       'loss giou': args.giou_loss_coef}
+    if args.aux_loss:
         aux_weight_dict = {}
         for i in range(args.dec_layers - 1):
             aux_weight_dict.update({k + f'_{i}': v for k, v in weight_dict.items()})
         aux_weight_dict.update({k + f'_enc': v for k, v in weight_dict.items()})
         weight_dict.update(aux_weight_dict)
-    """
-    if add aux loss
-    weight_dict = {'loss_cls': args.cls_loss_coef,
-                       'loss_bbox': args.bbox_loss_coef,
-                       'loss_giou': args.giou_loss_coef
-                       'loss_cls_enc': args.cls_loss_coef,
-                       'loss_bbox_enc': args.bbox_loss_coef,
-                       'loss_giou_enc': args.giou_loss_coef,
-                       'loss_cls_1':args.cls_loss_coef,
-                       'loss_bbox_1':args.bbox_loss_coef,
-                       'loss_giou_1':args.giou_loss_coef,
-                       'loss_cls_2':args.cls_loss_coef,
-                       'loss_bbox_2':args.bbox_loss_coef,
-                       'loss_giou_2':args.giou_loss_coef
-                       'loss_cls_3':args.cls_loss_coef,
-                       'loss_bbox_3':args.bbox_loss_coef,
-                       'loss_giou_3':args.giou_loss_coef
-                       }
-    """
-
+    # 准备loss字典
     losses = ['labels', 'boxes', 'cardinality']
-    criterion = SetCriterion(num_classes, matcher, weight_dict, losses, focal_alpha=args.focal_alpha)
-    criterion.to(device)
+    if args.NC_branch:
+        losses = ['labels', 'NC_labels', 'boxes', 'cardinality']
 
+    # 准备该训练阶段可识别的类别数量和不可识别的类别标记
+    prev_intro_cls = args.PREV_INTRODUCED_CLS  # 上一个训练阶段结束时引入的类别数量，训练共4阶段
+    curr_intro_cls = args.CUR_INTRODUCED_CLS  # 当前训练阶段引入的类别数量，训练共4阶段
+    num_seen_classes = prev_intro_cls + curr_intro_cls  # 当前训练阶段的总可识别类别数量
+    invalid_cls_logits = list(range(num_seen_classes, num_classes - 1))  # unknown为最后一类, 不包含在invalid class中
+    print("Invalid classes are: " + str(invalid_cls_logits))
+
+    # 构建匈牙利匹配器，利用匈牙利匹配器构建loss计算模块
+    matcher = build_matcher(args)
+    criterion = SetCriterion(args, num_classes, matcher, weight_dict, losses, num_seen_classes, invalid_cls_logits)
+    criterion.to(device)
     """
-    初始化postprocessors
-    后处理模块为一个bbox字典{bbox:[{'scores': s, 'labels': l, 'boxes': b}]
+    Construct the postprocessors, which converts the model's output into the format expected by the coco api.
     """
-    # 将锚框从相对坐标映射到绝对坐标
     postprocessors = {'bbox': PostProcess()}
 
     return model, criterion, postprocessors
