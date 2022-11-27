@@ -640,12 +640,15 @@ class PostProcess(nn.Module):
 
     @torch.no_grad()
     def forward(self, outputs, target_sizes):
-        """ Perform the computation
-        Parameters:
-            outputs: raw outputs of the model
-            target_sizes: tensor of dimension [batch_size x 2] containing the size of each images of the batch
-                          For evaluation, this must be the original image size (before any data augmentation)
-                          For visualization, this should be the image size after data augment, but before padding
+        """
+        Perform the computation
+        :param outputs: raw outputs of the model
+        :param target_sizes: tensor of size [bs,2]
+               containing the size of each images of the batch
+               For evaluation, this must be the original image size (before any data augmentation)
+               For visualization, this should be the image size after data augment, but before padding
+        :return results: a list of dicts, and each dict contains the prediction for an image:
+                {scores,labels,boxes}
         """
         out_logits, out_bbox = outputs['pred_logits'], outputs['pred_boxes']
 

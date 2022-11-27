@@ -100,8 +100,11 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
     # 评估模式, 梯度不反向传播
     model.eval()
     criterion.eval()
+
     metric_logger = utils.MetricLogger(delimiter="  ")
+
     header = 'Test:'
+    # iou type is 'bbox'
     iou_types = tuple(k for k in postprocessors.keys())
     coco_evaluator = OWEvaluator(base_ds, iou_types)
 
@@ -113,13 +116,12 @@ def evaluate(model, criterion, postprocessors, data_loader, base_ds, device, out
         orig_target_sizes = torch.stack([t["orig_size"] for t in targets], dim=0)
         results = postprocessors['bbox'](outputs, orig_target_sizes)
 
-        res = {target['image_id'].item(): output for target, output in zip(targets, results)}
+        res = {target['image_id'].item(): result for target, result in zip(targets, results)}
         if coco_evaluator is not None:
             coco_evaluator.update(res)
 
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
-    # print("Averaged stats:", metric_logger)
     if coco_evaluator is not None:
         coco_evaluator.synchronize_between_processes()
 
