@@ -20,6 +20,7 @@ import heapq
 import operator
 import os
 from copy import deepcopy
+from .PesudoLabel import update_pseudo_labels
 
 
 def _get_clones(module, N):
@@ -265,9 +266,6 @@ class DeformableDETR(nn.Module):
 class SetCriterion(nn.Module):
     """
     This class computes the loss for DETR.
-    The process happens in two steps:
-    1) we compute hungarian assignment between ground truth boxes and the outputs of the model
-    2) we supervise each pair of matched ground-truth / prediction (supervise class and box)
     """
 
     def __init__(self, args, num_classes, matcher, weight_dict, losses, num_seen_classes, invalid_cls_logits):
@@ -471,67 +469,8 @@ class SetCriterion(nn.Module):
         In this part, get unmatched boxes as pseudo labels
         """
         if self.unmatched_boxes and epoch >= self.nc_epoch:
-            # feature heatmap，表示每个像素在所有通道上的平均激活强度，of size(bs,h,w)
-            res_feat = torch.mean(outputs['resnet_1024_feat'], 1)
-            # 根据一张img的query数量来生成从0到99的100个query
-            all_indices = torch.arange(outputs['pred_logits'].shape[1])
-
-            # i:img index in a batch, 循环处理每张图片
-            for i in range(len(indices)):
-                # 求所有query和matched query的差集，即unmatched query的索引
-                matched_indices = indices[i][0]
-                combined = torch.cat((all_indices, matched_indices))
-                uniques, counts = combined.unique(return_counts=True)
-                unmatched_indices = uniques[counts == 1]
-
-                # boxes: the coordinates of each bbox in the ith img, of size(n_queries,4)
-                boxes = outputs_without_aux['pred_boxes'][i]
-                img = samples.tensors[i].cpu().permute(1, 2, 0).numpy()
-                h, w = img.shape[:-1]
-                img_w = torch.tensor(w, device=owod_device)
-                img_h = torch.tensor(h, device=owod_device)
-                # 将bbox的坐标(x,y,h,w)转换为左下角(x,y)和右上角坐标(x,y)
-                unmatched_boxes = box_ops.box_cxcywh_to_xyxy(boxes)
-                unmatched_boxes = unmatched_boxes * torch.tensor([img_w, img_h, img_w, img_h], dtype=torch.float32).to(
-                    owod_device)
-                # 生成n_queries长度的零向量
-                means_bb = torch.zeros(all_indices.shape[0]).to(unmatched_boxes)
-
-                bb = unmatched_boxes
-                for j, _ in enumerate(means_bb):
-                    if j in unmatched_indices:
-                        # 上采样网络, 对feature heatmap线性插值扩大到img的分辨率, 输出分辨率(img_h, img_w)
-                        upsample = nn.Upsample(size=(img_h, img_w), mode='bilinear')
-                        # 扩张为size:(bs,c,h,w)->img_feat:(1,1,h,w),进行线性插值
-                        img_feat = upsample(res_feat[i].unsqueeze(0).unsqueeze(0))
-                        # img_feat:(img_h,img_w)
-                        img_feat = img_feat.squeeze(0).squeeze(0)
-                        # bbox左下角和右上角的坐标
-                        xmin = bb[j, :][0].long()
-                        ymin = bb[j, :][1].long()
-                        xmax = bb[j, :][2].long()
-                        ymax = bb[j, :][3].long()
-                        # 对于匹配到的bbox，计算每张图片feature heatmap中bbox左下角和右上角之间的平均激活强度
-                        means_bb[j] = torch.mean(img_feat[ymin:ymax, xmin:xmax])
-                        if torch.isnan(means_bb[j]):
-                            means_bb[j] = -10e10
-                    else:
-                        # 对于未匹配到的bbox,平均激活强度记为极大负值
-                        means_bb[j] = -10e10
-
-                # 选取平均激活强度最大的前k个未匹配bbox,topl_inds存储0-99之间的bbox索引
-                _, topk_inds = torch.topk(means_bb, self.top_unk)
-                topk_inds = torch.as_tensor(topk_inds)
-                topk_inds = topk_inds.cpu()
-
-                # 将unknown obj bbox的label设为最后一类
-                unk_label = torch.as_tensor([self.num_classes - 1], device=owod_device)
-                # 增加top_unk个pseudo labels
-                owod_targets[i]['labels'] = torch.cat(
-                    (owod_targets[i]['labels'], unk_label.repeat_interleave(self.top_unk)))
-                # 扩展这张img的匹配索引,index_i和index_j分别增加top_unk个索引
-                owod_indices[i] = (torch.cat((owod_indices[i][0], topk_inds)), torch.cat(
-                    (owod_indices[i][1], (owod_targets[i]['labels'] == unk_label).nonzero(as_tuple=True)[0].cpu())))
+            owod_targets, owod_indices = update_pseudo_labels(outputs_without_aux, owod_targets, owod_targets,
+                                                              owod_indices, owod_device, self.top_unk, self.num_classes)
 
         # Compute the average number of target boxes accross all nodes, for normalization purposes
         num_boxes = sum(len(t["labels"]) for t in targets)
@@ -560,51 +499,8 @@ class SetCriterion(nn.Module):
                 owod_device = aux_owod_outputs["pred_boxes"].device
 
                 if self.unmatched_boxes and epoch >= self.nc_epoch:
-                    ## get pseudo unmatched boxes from this section
-                    res_feat = torch.mean(outputs['resnet_1024_feat'], 1)  # 2 X 67 X 50
-                    queries = torch.arange(aux_owod_outputs['pred_logits'].shape[1])
-                    for i in range(len(indices)):
-                        combined = torch.cat((queries, self._get_src_single_permutation_idx(indices[i], i)[
-                            -1]))  ## need to fix the indexing
-                        uniques, counts = combined.unique(return_counts=True)
-                        unmatched_indices = uniques[counts == 1]
-                        boxes = aux_owod_outputs['pred_boxes'][i]  # [unmatched_indices,:]
-                        img = samples.tensors[i].cpu().permute(1, 2, 0).numpy()
-                        h, w = img.shape[:-1]
-                        img_w = torch.tensor(w, device=owod_device)
-                        img_h = torch.tensor(h, device=owod_device)
-                        unmatched_boxes = box_ops.box_cxcywh_to_xyxy(boxes)
-                        unmatched_boxes = unmatched_boxes * torch.tensor([img_w, img_h, img_w, img_h],
-                                                                         dtype=torch.float32).to(owod_device)
-                        means_bb = torch.zeros(queries.shape[0]).to(
-                            unmatched_boxes)  # torch.zeros(unmatched_boxes.shape[0])
-                        bb = unmatched_boxes
-                        ## [INFO]: iterating over the full list of boxes and then selecting the unmatched ones
-                        for j, _ in enumerate(means_bb):
-                            if j in unmatched_indices:
-                                upsaple = nn.Upsample(size=(img_h, img_w), mode='bilinear')
-                                img_feat = upsaple(res_feat[i].unsqueeze(0).unsqueeze(0))
-                                img_feat = img_feat.squeeze(0).squeeze(0)
-                                xmin = bb[j, :][0].long()
-                                ymin = bb[j, :][1].long()
-                                xmax = bb[j, :][2].long()
-                                ymax = bb[j, :][3].long()
-                                means_bb[j] = torch.mean(img_feat[ymin:ymax, xmin:xmax])
-                                if torch.isnan(means_bb[j]):
-                                    means_bb[j] = -10e10
-                            else:
-                                means_bb[j] = -10e10
-
-                        _, topk_inds = torch.topk(means_bb, self.top_unk)
-                        topk_inds = torch.as_tensor(topk_inds)
-
-                        topk_inds = topk_inds.cpu()
-                        unk_label = torch.as_tensor([self.num_classes - 1], device=owod_device)
-                        owod_targets[i]['labels'] = torch.cat(
-                            (owod_targets[i]['labels'], unk_label.repeat_interleave(self.top_unk)))
-                        owod_indices[i] = (torch.cat((owod_indices[i][0], topk_inds)), torch.cat((owod_indices[i][1], (
-                                    owod_targets[i]['labels'] == unk_label).nonzero(as_tuple=True)[0].cpu())))
-
+                    owod_targets, owod_indices = update_pseudo_labels(samples, aux_owod_outputs, owod_targets,
+                                                                      owod_indices, owod_device, self.top_unk, self.num_classes)
                 for loss in self.losses:
                     kwargs = {}
                     if loss == 'labels':
@@ -693,7 +589,6 @@ def build_OWDETR(args):
     device = torch.device(args.device)
     """
     Construct the 2-block model, which consists of a backbone and a deformable transformer
-    
     :param num_classes=91
     :param num_queries=100
     :param num_feature_levels=4
@@ -718,7 +613,6 @@ def build_OWDETR(args):
     model.to(device)
     """
     Construct the criterion branch, which computes the loss.
-    
     :param num_classes: total number of classes 
     :param num_seen_classes: number of recognized classes in current stage
     :param invalid_cls_logits: logits of unrecognized classes
