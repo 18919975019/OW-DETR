@@ -1,1 +1,1 @@
-GPUS_PER_NODE=1 ./tools/run_dist_launch.sh 1 configs/configuration.sh
+GPUS_PER_NODE=8 ./tools/run_dist_launch.sh 8 configs/configuration.sh

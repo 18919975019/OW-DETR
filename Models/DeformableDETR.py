@@ -12,8 +12,6 @@ from util.misc import (NestedTensor, nested_tensor_from_tensor_list,
                        is_dist_avail_and_initialized, inverse_sigmoid)
 from .ResNet_50 import build_backbone
 from .HungarianMatcher import build_matcher
-from .segmentation import (DETRsegm, PostProcessPanoptic, PostProcessSegm,
-                           dice_loss, sigmoid_focal_loss)
 from .DeformableTransformer import build_deforamble_transformer
 import copy
 import heapq
@@ -22,10 +20,29 @@ import os
 from copy import deepcopy
 from .PesudoLabel import update_pseudo_labels
 
-
 def _get_clones(module, N):
     return nn.ModuleList([copy.deepcopy(module) for i in range(N)])
 
+def sigmoid_focal_loss(inputs, targets, num_boxes, alpha: float = 0.25, gamma: float = 2):
+    """
+    Loss used in RetinaNet for dense detection: https://arxiv.org/abs/1708.02002.
+    :param inputs: A float tensor of arbitrary shape.The predictions for each example.
+    :param targets: A float tensor with the same shape as inputs. Stores the binary classification label for
+                    each element in inputs (0 for the negative class and 1 for the positive class).
+    :param alpha: (optional) Weighting factor in range (0,1) to balance positive vs negative examples. Default = -1 (no weighting).
+    :param gamma: Exponent of the modulating factor (1 - p_t) to balance easy vs hard examples.
+    :return Loss tensor
+    """
+    prob = inputs.sigmoid()
+    ce_loss = F.binary_cross_entropy_with_logits(inputs, targets, reduction="none")
+    p_t = prob * targets + (1 - prob) * (1 - targets)
+    loss = ce_loss * ((1 - p_t) ** gamma)
+
+    if alpha >= 0:
+        alpha_t = alpha * targets + (1 - alpha) * (1 - targets)
+        loss = alpha_t * loss
+
+    return loss.mean(1).sum() / num_boxes
 
 class DeformableDETR(nn.Module):
     """
@@ -107,7 +124,7 @@ class DeformableDETR(nn.Module):
             nn.init.constant_(proj[0].bias, 0)
 
 
-        n_pred = transformer.decoder.num_layers
+        n_pred = transformer.decoder.n_layers
         if with_box_refine:
             # 深拷贝,为每个decoder每一层设置一个bbox_predictor和class_predictor,利用decoder每一层的输出向量来预测一次类别+框坐标
             self.class_predictor = _get_clones(self.class_predictor, n_pred)
@@ -186,13 +203,13 @@ class DeformableDETR(nn.Module):
 
         """In this part, the transformer takes prepared features, pos embeds and queries as input and output the class
            and bbox coordinates of the queries."""
-        hs, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
+        DEC_Hidden, init_reference, inter_references, enc_outputs_class, enc_outputs_coord_unact = \
             self.transformer(srcs, masks, pos, query_embeds)
         outputs_classes = []
         outputs_coords = []
         outputs_classes_obj = []
 
-        for layer in range(hs.shape[0]):
+        for layer in range(DEC_Hidden.shape[0]):
             # 提取当前层的参考点
             if layer == 0:
                 reference = init_reference
@@ -201,14 +218,14 @@ class DeformableDETR(nn.Module):
             reference = inverse_sigmoid(reference)
 
             # 用decoder当前层输出向量预测类别
-            outputs_class = self.class_predictor[layer](hs[layer])
+            outputs_class = self.class_predictor[layer](DEC_Hidden[layer])
 
             # 用decoder当前层输出向量预测前景概率(objectiveness)
             if self.obj_cls:
-                outputs_class_obj = self.obj_predictor[layer](hs[layer])
+                outputs_class_obj = self.obj_predictor[layer](DEC_Hidden[layer])
 
             # 用decoder当前层输出向量预测bbox坐标
-            tmp = self.bbox_predictor[layer](hs[layer])
+            tmp = self.bbox_predictor[layer](DEC_Hidden[layer])
             if reference.shape[-1] == 4:
                 tmp += reference
             else:

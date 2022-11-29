@@ -14,7 +14,7 @@ NODE_RANK=${NODE_RANK:-0}
 
 let "NNODES=GPUS/GPUS_PER_NODE"
 
-python ./tools/launch.py \
+python ./Launch/launch.py \
     --nnodes ${NNODES} \
     --node_rank ${NODE_RANK} \
     --master_addr ${MASTER_ADDR} \
