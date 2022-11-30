@@ -62,6 +62,34 @@ sh ./make.sh
 # unit test (should see all checking is True)
 python test.py
 ```
-#Training
+## Training
 As its nature of Incremental Object Detection, the training is split to 4 stages. The current stage would introduce new seen classes and continue to train
-the pretrain model out of previous stage. 
+the pretrain model out of previous stage. The configuration for hyparameters of 4 stages is at: ```./OW-DETR/configs/```.
+
+If train using 1 GPU, you can directly use command:
+```
+cd ./OW-DETR
+run_uniGPU.sh
+```
+If train using mulitple GPU in a distributed environment, you can use command:
+```
+cd ./OW-DETR
+run.sh
+```
+This shell first configures and calls run_dist_launch.sh, and run_dist_launch.sh calls launch.py to launch distributed computation, where training script is asigned to multiple processes at multiple nodes.
+## Evaluation
+Use following command:
+```
+cd ./OW-DETR
+run_eval.sh
+```
+## Citation
+```
+@inproceedings{gupta2021ow,
+    title={OW-DETR: Open-world Detection Transformer}, 
+    author={Gupta, Akshita and Narayan, Sanath and Joseph, KJ and 
+    Khan, Salman and Khan, Fahad Shahbaz and Shah, Mubarak},
+    booktitle={CVPR},
+    year={2022}
+}
+```
