@@ -1,1 +1,1 @@
-configs/configuration.sh
+configs/train.sh
